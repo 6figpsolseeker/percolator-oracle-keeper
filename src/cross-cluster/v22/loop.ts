@@ -45,7 +45,7 @@ import { readMarginParams } from "./liquidation.ts";
 import { RENT_SETTLES_PER_ROUND, DEFERRAL_ESCALATION_AFTER, DEFERRAL_ESCALATION_SLOTS, DEFAULT_SWEEP_ROUND_CONFIG, freshGapBackoff, pairingStats, runSettleRound } from "./sweep.ts";
 import type { GapBackoff, RentPlanInput as RoundInputRent, RoundResult, SweepDeps, SweepRoundConfig } from "./sweep.ts";
 import { redactErrorText } from "./redact.ts";
-import { loneLpCrankSuppressed, markV22Market, portfolioWeight, weightBudgetFor } from "./settle-pairing.ts";
+import { isKnownV22Market, loneLpCrankSuppressed, markV22Market, portfolioWeight, weightBudgetFor } from "./settle-pairing.ts";
 import { crankBondFee } from "./fee-bond.ts";
 import { freshRentState, markRentSettled, planRentSettles, settleRentOnce } from "./rent.ts";
 import { buildSettleHoldingRentIxV22 } from "@percolatorct/sdk";
@@ -63,12 +63,19 @@ import { adlHealthOf } from "../adl-state.ts";
 import { getAlertSink } from "../alerting.ts";
 import type { Alert, AlertSink } from "../alerting.ts";
 import { terminalKindOf } from "./band.ts";
+import { assessDepthCapacity, depthCapacityAlert, depthCapacityThresholdsFromEnv } from "./depth-capacity.ts";
+import type { DepthCapacity, DepthCapacityThresholds } from "./depth-capacity.ts";
+import { pushDepthEnabled } from "../push-depth.ts";
+import { decodeAssetGrowthV19 } from "@percolatorct/sdk";
 import { LP_CERT_ALERT_SCOPE, evaluateVaultLpCrankStaleness, lpCertLevelOf, lpCertStalenessOf, lpCertThresholdsFromEnv, readLpCertAssets } from "./lp-cert-liveness.ts";
 import type { LpCertThresholds } from "./lp-cert-liveness.ts";
 import { ADL_D1_ALERT_SCOPE, AdlEpisodeTracker, adlD1ThresholdsFromEnv, evaluateAdlD1 } from "./d1-watch.ts";
 import type { AdlAssetReading, AdlD1Thresholds, AdlEpisode } from "./d1-watch.ts";
 import { ADL_ONE, decodeAdlState } from "../adl-state.ts";
 import { engineSlotBase } from "../market-layout.ts";
+import { LifecycleEngine } from "./lifecycle.ts";
+import { crankLpFeesOnce } from "../lp-fee-cranker.ts";
+import { pushStakeFeesOnce, stakeFeeConfigFromEnv } from "../stake-fee-pusher.ts";
 
 export interface V22LoopDeps {
   /** Minimum ms between two catch-up txs across ALL markets (default KEEPER_V22_CATCHUP_SPACING_MS or 1500). */
@@ -77,7 +84,7 @@ export interface V22LoopDeps {
   keeper: Keypair;
   programId: PublicKey;
   /** The live registry (hot-reloaded in place). */
-  markets: () => ReadonlyArray<Pick<MarketEntry, "marketAddress" | "label" | "lpPortfolio">>;
+  markets: () => ReadonlyArray<Pick<MarketEntry, "marketAddress" | "label" | "lpPortfolio"> & Partial<Pick<MarketEntry, "dexType" | "assets">>>;
   flags: V22Flags;
   /** Global DRY_RUN / --dry-run. */
   dryRun: boolean;
@@ -91,6 +98,8 @@ export interface V22LoopDeps {
   lpCertThresholds?: LpCertThresholds;
   /** D1 close-only / wind-down thresholds (default: from ALERT_ADL_WIND_DOWN_* env, boot-safe). */
   adlD1Thresholds?: AdlD1Thresholds;
+  /** #174 depth-capacity thresholds (default: from ALERT_DEPTH_* env, boot-safe). */
+  depthCapacityThresholds?: DepthCapacityThresholds;
   now?: () => number;
   log?: (s: string) => void;
 }
@@ -136,6 +145,10 @@ interface MarketRuntime {
   repairBackoffUntilMs: number;
   /** Active vault-LP crank liveness alerts from the last GOOD read (kept across a failed read, never cleared by one). */
   lpCertAlerts: Alert[];
+  /** #174: active depth-capacity alerts from the last decodable read. */
+  depthAlerts: Alert[];
+  /** #174: /health view of every clamp-enforced growth asset's depth cap at the last decodable read. */
+  lastDepth: DepthCapacity[] | null;
   /** /health: the LP certification staleness of the worst asset at the last good read. */
   lastLpCert: { assetIndex: number; certified: boolean; staleSlots: string; horizonSlots: string; remainingSlots: string; level: string; horizonSource: string } | null;
   /** D1: per-market close-only episode tracker (in memory; a restart makes ages lower bounds). */
@@ -145,6 +158,9 @@ interface MarketRuntime {
   /** D1: /health view of the close-only episodes at the last good read. */
   lastAdl: { episodes: Array<{ assetIndex: number; ageSlots: string; observedSinceSlot: string; sinceBoot: boolean; level: string; slotsToBound: string }>; endedEpisodes: number; longestEndedSlots: string; endedPastBound: number } | null;
 }
+
+/** #174: depth-capacity alerts (scopes `:warn` / `:critical`). */
+export const DEPTH_CAPACITY_ALERT_SCOPE = "v22-depth-capacity";
 
 const POSITIONED_TTL_MS = 10_000;
 /** Margin on a simulated one-crank catch-up cost when sizing the catch-up tx (per-crank cost varies a few % with state). */
@@ -156,17 +172,76 @@ export class V22Loop {
   private readonly now: () => number;
   private readonly lpCertThresholds: LpCertThresholds;
   private readonly adlD1Thresholds: AdlD1Thresholds;
+  private readonly depthThresholds: DepthCapacityThresholds;
   private ticks = 0;
   private lastTickAt: number | null = null;
   private layoutProblems = new Map<string, string>();
   /** v22price 2026-10-22: when the last catch-up tx (any market) was started; see `catchupSpacingMs`. */
   private lastCatchupAtMs = Number.NEGATIVE_INFINITY;
+  /** Market lifecycle: dead-market classifier, permissionless stale resolve (default OFF), warn-band fee forcing (default OFF). */
+  private readonly lifecycle: LifecycleEngine | null;
 
   constructor(private readonly d: V22LoopDeps) {
     this.log = d.log ?? ((s) => console.log(s));
     this.now = d.now ?? Date.now;
     this.lpCertThresholds = d.lpCertThresholds ?? lpCertThresholdsFromEnv(process.env);
     this.adlD1Thresholds = d.adlD1Thresholds ?? adlD1ThresholdsFromEnv(process.env);
+    this.depthThresholds = d.depthCapacityThresholds ?? depthCapacityThresholdsFromEnv(process.env);
+    const lc = d.flags.lifecycle;
+    if (lc.classify) {
+      const sink = d.alertSink ?? getAlertSink();
+      this.lifecycle = new LifecycleEngine({
+        conn: d.conn as never,
+        keeper: d.keeper,
+        programId: d.programId,
+        cfg: lc,
+        dryRun: d.dryRun || d.flags.dryRun,
+        registered: (m) => this.d.markets().some((x) => x.marketAddress === m),
+        sink: { reconcile: (scope, a) => sink.reconcile(scope, a), fire: async (scope, a) => ("fire" in sink && typeof sink.fire === "function" ? (sink as Pick<AlertSink, "fire">).fire(scope, a) : false) },
+        forceFees: lc.warnBandFees ? (ctx) => this.forceFeesFor(ctx) : undefined,
+        sourceGroup: (m) => {
+          const row = this.d.markets().find((x) => x.marketAddress === m);
+          if (!row) return null;
+          if (row.dexType) return row.dexType;
+          const dex = [...new Set((row.assets ?? []).map((a) => (a.source === "pool" ? (a.dexType ?? "pool") : "fixed")))].sort();
+          return dex.length > 0 ? dex.join("+") : null;
+        },
+        now: d.now,
+        log: this.log,
+      });
+    } else {
+      this.lifecycle = null;
+    }
+  }
+
+  /**
+   * Warn-band fee round (KEEPER_V22_WARN_BAND_FEES): tag 78 (the LP leg) and tag 87 + stake 12 (the staker leg) NOW, whatever the
+   * fee loop's cadence and the push thresholds say. Both are Live-only and refused once the stale window matures, and an
+   * uncranked staker leg is forfeited at resolve. Reuses the normal crankers: bond markets go through the v2.2 bond fee path (with
+   * the settle-pairing policy), the rest through the legacy tag-78 job, and tag 87 through the stake-fee pusher with its minimum
+   * push lowered to 1 atom. The pusher's dead-share gate stays (it protects stakers from a griefing dust deposit).
+   */
+  private async forceFeesFor(ctx: V22MarketCtx): Promise<string> {
+    const f = this.d.flags;
+    const dry = this.d.dryRun || f.dryRun;
+    const parts: string[] = [];
+    // Never alongside a v2.2 settle round on the same market (a round may be settling the vault LP): defer to the next tick.
+    const r = this.rtFor(ctx.marketAddress);
+    if (r.sweepInflight) return "deferred: a v2.2 settle round is in flight on this market";
+    {
+      if (f.feeCrankBond && ctx.bond) {
+        const positioned = await this.positionedFor(ctx, r);
+        const res = await crankBondFee(this.sweepDeps(), ctx, positioned, { mode: pairingActive(f) ? f.pairing : "off", weightBudget: weightBudgetFor() });
+        parts.push(`78(bond) ${res.kind === "skipped" ? `skipped: ${res.reason}` : res.kind}`);
+      } else {
+        const o = await crankLpFeesOnce(this.d.conn as never, this.d.keeper, ctx.marketAddress, dry);
+        parts.push(`78 ${typeof o === "string" ? o : o.error}`);
+      }
+      const stakeCfg = { ...stakeFeeConfigFromEnv(process.env), minPushAtoms: 1n };
+      const st = await pushStakeFeesOnce(this.d.conn as never, this.d.keeper, ctx.marketAddress, dry, stakeCfg);
+      parts.push(`87+12 ${st.kind}${st.kind === "skipped" ? `: ${st.reason}` : st.kind === "failed" ? `: ${st.error}` : st.kind === "waiting" || st.kind === "blocked" ? `: ${st.reason}` : ""}`);
+      return parts.join("; ");
+    }
   }
 
   /**
@@ -230,6 +305,60 @@ export class V22Loop {
       };
     } catch (err) {
       this.log(`[v22][d1] ${ctx.label}: close-only read failed (alert state kept): ${redactErrorText(err instanceof Error ? err.message : String(err), 140)}`);
+    }
+  }
+
+  /**
+   * #174: depth capacity of every growth asset of a loaded market (depth-capacity.ts). Read-only: the market bytes this tick already
+   * read, no RPC, nothing sent. A non-band / terminal market clears its state; an undecodable record keeps the previous one. Never throws.
+   */
+  private checkDepthCapacity(ctx: V22MarketCtx, r: MarketRuntime, venue: string | null): void {
+    if (!ctx.isBand || terminalKindOf(ctx.data) !== null) {
+      r.depthAlerts = [];
+      r.lastDepth = null;
+      return;
+    }
+    try {
+      const nowSlot = BigInt(ctx.readSlot);
+      const bandBps = ctx.band.bandBps > 0xffff_ffffn ? Number.MAX_SAFE_INTEGER : Number(ctx.band.bandBps);
+      const assets: DepthCapacity[] = [];
+      const alerts: Alert[] = [];
+      for (const assetIndex of observationAssetsFor(ctx.marketAddress)) {
+        let g: ReturnType<typeof decodeAssetGrowthV19>;
+        try {
+          g = decodeAssetGrowthV19(ctx.data, assetIndex);
+        } catch {
+          continue; // an asset the account does not carry: not evaluated, the others are
+        }
+        if (g === null) continue;
+        const d = assessDepthCapacity(g, assetIndex, bandBps, nowSlot, this.depthThresholds);
+        assets.push(d);
+        const a = depthCapacityAlert(ctx.label, ctx.marketAddress, d, this.depthThresholds, { venue, keeperAttestsVenue: venue === "pumpswap" && pushDepthEnabled() });
+        if (a) alerts.push(a);
+      }
+      r.depthAlerts = alerts;
+      r.lastDepth = assets;
+    } catch (err) {
+      this.log(`[v22][depth] ${ctx.label}: depth-capacity read failed (alert state kept): ${redactErrorText(err instanceof Error ? err.message : String(err), 140)}`);
+    }
+  }
+
+  /** #174: reconcile the depth-capacity alerts. Two scopes (warn-or-worse / critical-only), like the vault-LP certification, so a warn -> critical escalation pages at once. */
+  private async reconcileDepthCapacity(): Promise<void> {
+    const warn: Alert[] = [];
+    const critical: Alert[] = [];
+    for (const m of this.d.markets()) {
+      for (const a of this.rt.get(m.marketAddress)?.depthAlerts ?? []) {
+        warn.push(a.severity === "warn" ? a : { ...a, severity: "warn" });
+        if (a.severity === "critical") critical.push(a);
+      }
+    }
+    try {
+      const sink = this.d.alertSink ?? getAlertSink();
+      await sink.reconcile(`${DEPTH_CAPACITY_ALERT_SCOPE}:warn`, warn);
+      await sink.reconcile(`${DEPTH_CAPACITY_ALERT_SCOPE}:critical`, critical);
+    } catch (err) {
+      this.log(`[v22][depth] alert delivery failed: ${redactErrorText(err instanceof Error ? err.message : String(err), 140)}`);
     }
   }
 
@@ -308,6 +437,8 @@ export class V22Loop {
         positionedCache: null,
         sweepInflight: false,
         lpCertAlerts: [],
+        depthAlerts: [],
+        lastDepth: null,
         lastLpCert: null,
         adlTracker: new AdlEpisodeTracker(this.adlD1Thresholds),
         adlAlerts: [],
@@ -336,8 +467,12 @@ export class V22Loop {
     setV22HealthProvider(() => this.healthFields());
   }
 
+  /**
+   * Sticky: once a good read showed variant B, a later failed read ("unreadable") must not re-enable the lone LP crank
+   * or switch off the protective round. `layoutNote` still shows the latest read on /health.
+   */
   private isV22(addr: string): boolean {
-    return this.rt.has(addr) && this.rt.get(addr)?.layoutNote === "v2.2-b";
+    return isKnownV22Market(addr);
   }
 
   private async positionedFor(ctx: V22MarketCtx, r: MarketRuntime): Promise<V22Positioned | null> {
@@ -368,11 +503,18 @@ export class V22Loop {
 
   /**
    * The recovery cranker's per-market hook for a variant-B market (KEEPER_V22_SWEEP). Returns true ONLY when this layer
-   * actually ran (or a round is already running); on every "could not run" path it returns FALSE so the legacy
-   * accrual-only crank still runs this cycle (review F-5: the engine clock must keep moving).
+   * actually ran (or a round is already running); on every "could not run" path it declines so the legacy cycle still
+   * runs (review F-5: the engine clock must keep moving). LF: that cycle's accrual crank targets the vault LP and settles
+   * it alone, so where the lone LP crank is suppressed it declines "clock-only" (repairs and catch-up, no accrual crank;
+   * counted `declinedClockOnly`). The cranker calls this only for a variant-B market, so the market is v2.2 even when
+   * this cycle's own read failed.
    */
-  async sweepDelegate(a: SweepDelegateArgs): Promise<boolean> {
-    return this.runRoundFor(a.conn, a.entry, false);
+  async sweepDelegate(a: SweepDelegateArgs): Promise<boolean | "clock-only"> {
+    if (await this.runRoundFor(a.conn, a.entry, false)) return true;
+    const f = this.d.flags;
+    if (!loneLpCrankSuppressed({ loneLpCrankFlag: f.loneLpCrank, pairingActive: pairingActive(f), isV22Market: true })) return false;
+    pairingStats.declinedClockOnly++;
+    return "clock-only";
   }
 
   private async runRoundFor(conn: Connection, entry: { marketAddress: string; label: string; lpPortfolio?: string }, protective: boolean): Promise<boolean> {
@@ -409,7 +551,7 @@ export class V22Loop {
       }
       const positioned = await this.positionedFor(ctx, r);
       if (!positioned || !positioned.lp) {
-        this.log(`[v22][sweep] ${ctx.label}: no vault LP portfolio or the positioned set is unreadable; leaving this cycle to the legacy accrual crank`);
+        this.log(`[v22][sweep] ${ctx.label}: no vault LP portfolio or the positioned set is unreadable; leaving this cycle to the legacy fallback`);
         return false;
       }
       // K-6 (+ LIQ-DIAG 2026-10-17: every market, not only multi-asset): a market whose oldest observed asset is a full
@@ -475,7 +617,21 @@ export class V22Loop {
         },
         roundCfg,
       );
-      if (res.backedOff) return false; // nothing ran: let the legacy accrual crank run this cycle (N-4)
+      if (res.backedOff) {
+        // N-4 + LF: no round this cycle, but the clock must keep moving (F-5). Declining here made the legacy fallback crank
+        // the vault LP alone about one cycle after phase 1 settled the counterparties. The positioned set is in hand, so
+        // accrue through the flat anchor, else the lightest unquarantined counterparty (settles only it, as phase 1 does).
+        const nowSlot = BigInt(ctx.readSlot);
+        const cp = positioned.counterparties.filter((c) => !((r.quarantine.get(c.pubkey.toBase58()) ?? 0n) > nowSlot)).sort((x, y) => portfolioWeight(x) - portfolioWeight(y))[0];
+        const target = useAnchor ?? cp?.pubkey ?? null;
+        if (!target) return false;
+        const out = await simulateAndSend(this.execCtx(), [buildObservationCrankIx(this.d.keeper.publicKey, ctx.market, target, crankOracleAccounts(ctx))], { job: "backoff-accrue", label: ctx.label, units: MAX_TX_CU });
+        if (useAnchor) pairingStats.anchorAccrues++;
+        else pairingStats.counterpartyAccrues++;
+        const what = out.kind === "sent" ? `sent ${out.landed}` : out.kind === "refused" ? `refused ${out.name}` : out.kind === "failed" ? `failed ${out.error}` : out.kind;
+        this.log(`[v22][sweep] ${ctx.label}: ${res.abandoned}; accrue-only crank on ${useAnchor ? "the flat anchor" : "a counterparty"} ${target.toBase58().slice(0, 8)}…: ${what}`);
+        return true;
+      }
       if (res.anchorRefused) {
         r.anchorBadRounds = 5;
         this.log(`[v22][sweep] ${ctx.label}: the program refused the flat-anchor accrue; using the counterparty accrue form for 5 rounds`);
@@ -645,15 +801,20 @@ export class V22Loop {
     this.lastTickAt = this.now();
     const f = this.d.flags;
     const exec = this.execCtx();
+    this.lifecycle?.beginTick();
     for (const entry of this.d.markets()) {
       try {
         const load = await loadV22Market(this.d.conn, entry, this.d.programId);
+        // An RPC failure (not "the account is gone") makes this tick an unclean observation for the lifecycle guards.
+        if (!load.ok && load.reason === "unreadable" && load.detail !== "market account not found") this.lifecycle?.noteReadFailure();
         const ctx = this.noteLoad(entry, load);
         if (!ctx) continue;
         const r = this.rtFor(entry.marketAddress);
         r.lastBand = bandHealthFor(ctx);
+        this.lifecycle?.observe(ctx); // dead-market classifier, read-only, no extra RPC
         await this.checkLpCert(ctx, r); // read-only; runs even while a round is in flight
         this.checkAdlCloseOnly(ctx, r); // D1, read-only, no extra RPC
+        this.checkDepthCapacity(ctx, r, entry.dexType ?? null); // #174, read-only, no extra RPC
         if (r.sweepInflight) continue;
         const needsPositioned = f.feeCrankBond || f.holdingRent || f.dustSweep;
         const positioned = needsPositioned ? await this.positionedFor(ctx, r) : null;
@@ -682,7 +843,7 @@ export class V22Loop {
           const poolInfo = await this.d.conn.getAccountInfo(deriveStakePool(ctx.market, STAKE_PROGRAM_ID)[0], "processed");
           const s = await stakeSyncOnce(exec, ctx, poolInfo ? new Uint8Array(poolInfo.data) : null, r.stake, { intervalMs: f.stakeSyncIntervalMs, nowMs: this.now() });
           r.lastStake = s.kind;
-          if (s.kind === "diverged") this.log(`[v22][stake-sync] ${ctx.label}: InsuranceReadingsDiverged(44): refused; backing off ${r.stake.diverged} time(s), no retry until the backoff ends`);
+          if (s.kind === "diverged") this.log(`[v22][stake-sync] ${ctx.label}: InsuranceReadingsDiverged(44): backing off ${r.stake.diverged} time(s), no retry until the backoff ends`);
         }
         if (f.stakeCommitTarget) {
           const poolInfo = await this.d.conn.getAccountInfo(deriveStakePool(ctx.market, STAKE_PROGRAM_ID)[0], "processed");
@@ -698,10 +859,17 @@ export class V22Loop {
         }
       } catch (err) {
         this.log(`[v22] ${entry.label}: tick error: ${redactErrorText(err instanceof Error ? err.message : String(err), 140)}`);
+        this.lifecycle?.noteReadFailure();
       }
     }
     await this.reconcileLpCert();
     await this.reconcileAdlD1();
+    await this.reconcileDepthCapacity();
+    try {
+      await this.lifecycle?.endTick();
+    } catch (err) {
+      this.log(`[v22][lifecycle] tick failed: ${redactErrorText(err instanceof Error ? err.message : String(err), 140)}`);
+    }
   }
 
   /**
@@ -742,6 +910,7 @@ export class V22Loop {
         ...(r.lastBand ? { band: r.lastBand } : {}),
         ...(r.lastLpCert ? { vaultLpCert: r.lastLpCert } : {}),
         ...(r.lastAdl ? { adlCloseOnly: r.lastAdl } : {}),
+        ...(r.lastDepth && r.lastDepth.length > 0 ? { depthCapacity: r.lastDepth.map((d) => ({ assetIndex: d.assetIndex, status: d.status, capDepthE6: d.capDepthE6 === null ? null : d.capDepthE6.toString(), stickyEpochs: d.stickyEpochs, epochsToZero: d.epochsToZero, depthAgeSlots: d.depthAgeSlots === null ? null : d.depthAgeSlots.toString(), depthSource: d.depthSource, depthDexPinned: d.depthDexPinned })) } : {}),
         ...(r.lastRound ? { lastRound: r.lastRound } : {}),
         ...(r.lastFee ? { fee78: r.lastFee } : {}),
         ...(r.lastG9 ? { g9: r.lastG9 } : {}),
@@ -750,6 +919,7 @@ export class V22Loop {
         ...(r.lastEarn ? { earnExit: r.lastEarn } : {}),
         ...(r.escalated.size > 0 ? { persistentDeferrals: [...r.escalated].map(([k, v]) => ({ portfolio: k, rounds: v.count, sinceMsAgo: this.now() - v.atMs })) } : {}),
         ...(this.layoutProblems.has(addr) ? { layoutProblem: redactErrorText(this.layoutProblems.get(addr) as string, 200) } : {}),
+        ...(this.lifecycle?.view(addr) ? { lifecycle: this.lifecycle.view(addr) } : {}),
       };
     }
     return {
@@ -761,6 +931,7 @@ export class V22Loop {
       jobs: allJobCounters(),
       layoutProblems: Object.fromEntries([...this.layoutProblems].map(([k, v]) => [k, redactErrorText(v, 200)])),
       markets,
+      ...(this.lifecycle ? { lifecycle: this.lifecycle.healthFields() } : {}),
     };
   }
 }
