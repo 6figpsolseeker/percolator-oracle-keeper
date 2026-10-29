@@ -73,7 +73,7 @@ import fs from "fs";
 import path from "path";
 import { fileURLToPath } from "url";
 import { DEFAULT_REGISTRY_FILE, loadRegistryForProgramSet } from "./cross-cluster/registry.ts";
-import { bindObservationRegistry, validateMultiAssetEntry } from "./cross-cluster/multi-asset.ts";
+import { bindObservationRegistry, registryRowProblems } from "./cross-cluster/multi-asset.ts";
 import { bootPositiveNumberEnv, parsePositiveLamportsFromSolEnv, parsePositiveNumberEnv } from "./env-utils.ts";
 import { isExplicitTrue, validateRpcEndpoint } from "./rpc-url.ts";
 import { startKeeperLoop } from "./cross-cluster/keeper-loop.ts";
@@ -121,6 +121,8 @@ import { fetchMarketPortfolios } from "./cross-cluster/recovery-cranker.ts";
 import { v22FlagsFromEnv, describeV22Flags } from "./cross-cluster/v22/flags.ts";
 import { V22Loop, startV22Loop } from "./cross-cluster/v22/loop.ts";
 import { setLoneLpCrankSuppressor } from "./cross-cluster/v22/delegation.ts";
+import { LevGuardKeeper, levGuardConfigFromEnv, levGuardEnabled, loadRiskKey } from "./cross-cluster/v22/lev-guard.ts";
+import { setLevGuardHealthProvider } from "./cross-cluster/v22/health.ts";
 import { countingFetch } from "./cross-cluster/rpc-metrics.ts";
 import { failoverFromEnv, parseFallbackUrls } from "./rpc-failover.ts";
 import { readHealth, recordLaunch, restartConfig } from "./restart-escalation.ts";
@@ -353,12 +355,12 @@ const REGISTRY_RELOAD_INTERVAL_MS = bootPositiveNumberEnv("REGISTRY_RELOAD_INTER
 // ── Boot ───────────────────────────────────────────────────────────────────────
 const keeper = loadKeypair();
 const registry = loadRegistryForProgramSet(REGISTRY_PATH, PROGRAM_IDS_RESOLVED.programSet);
-// K-6: multi-asset rows must be well formed (the keeper never guesses a source or an asset), and every observation
+// K-6 / A8-4: every row must be well formed (the keeper never guesses a key, a source or an asset), and every observation
 // crank looks its market's asset list up in the LIVE registry (hot-reloaded in place, hence the getter).
 {
-  const problems = registry.markets.flatMap((m) => validateMultiAssetEntry(m));
+  const problems = registryRowProblems(registry.markets);
   if (problems.length > 0) {
-    console.error(`[fatal] registry ${REGISTRY_PATH}: invalid multi-asset row(s):\n  ${problems.join("\n  ")}`);
+    console.error(`[fatal] registry ${REGISTRY_PATH}: invalid registry row(s):\n  ${problems.join("\n  ")}`);
     process.exit(1);
   }
 }
@@ -502,6 +504,41 @@ if (V22_FLAGS.enabled) {
   console.log("[v22] VAULT_LP_LONE_CRANK=off: the lone vault-LP crank after a landed push is suppressed on every market");
 }
 
+// Leverage guard (wrapper tag 124): POKE after a landed push / before an Earn allocation (KEEPER_LEV_POKE), the hourly holder job
+// (KEEPER_LEV_HOLDER_JOB, optional KEEPER_LEV_RISK_KEY_PATH) and the W1 LP-stop cranker (KEEPER_LEV_W1). All default OFF; with all of them off nothing
+// is constructed, no instruction is built and /health gains no key. See cross-cluster/v22/lev-guard.ts.
+const LEV_GUARD_CONFIG = levGuardConfigFromEnv();
+function loadRiskKeyOrExit(path: string): Keypair | null {
+  try {
+    return loadRiskKey(path);
+  } catch (err) {
+    console.error(`[fatal] ${err instanceof Error ? err.message : String(err)}`);
+    process.exit(1);
+  }
+}
+const levGuard = levGuardEnabled(LEV_GUARD_CONFIG)
+  ? new LevGuardKeeper({
+      conn: devnetConn,
+      keeper,
+      programId: CFG_WRAPPER_PROGRAM_ID,
+      dryRun: DRY_RUN || V22_FLAGS.dryRun,
+      config: LEV_GUARD_CONFIG,
+      riskKey: LEV_GUARD_CONFIG.holderJob && LEV_GUARD_CONFIG.riskKeyPath ? loadRiskKeyOrExit(LEV_GUARD_CONFIG.riskKeyPath) : null,
+    })
+  : null;
+if (levGuard) {
+  setLevGuardHealthProvider(() => levGuard.healthFields());
+  console.log(
+    `[lev-guard] ON poke=${LEV_GUARD_CONFIG.poke} holderJob=${LEV_GUARD_CONFIG.holderJob} w1=${LEV_GUARD_CONFIG.w1} riskKey=${!!(LEV_GUARD_CONFIG.holderJob && LEV_GUARD_CONFIG.riskKeyPath)}${DRY_RUN || V22_FLAGS.dryRun ? " (DRY-RUN: simulate and log, send nothing)" : ""}`,
+  );
+  if (LEV_GUARD_CONFIG.holderJob) {
+    // each market runs at most once per KEEPER_LEV_HOLDER_INTERVAL_MS; this timer only checks who is due
+    setInterval(() => {
+      void levGuard.holderTick(registry.markets).catch(() => {});
+    }, 60_000).unref();
+  }
+}
+
 const bootCrankStates = CRANK_ENABLED ? await crankAllOnce(devnetConn, keeper, registry, DRY_RUN) : undefined;
 
 // Recovery crank loop runs concurrently on its own interval — deliberately
@@ -617,7 +654,15 @@ if (P2B_GATE_CONFIG.mode !== "off") {
     sink: ALERT_SINK,
     allocator: new VaultLpAllocator(
       { ...P2B_ALLOCATE_CONFIG, dryRun: DRY_RUN },
-      { programId: CFG_WRAPPER_PROGRAM_ID, conn: devnetConn, keeper, walletLow: () => p2bLoop.walletLow(), onUnsupported: () => gate.reportUnsupported() },
+      {
+        programId: CFG_WRAPPER_PROGRAM_ID,
+        conn: devnetConn,
+        keeper,
+        walletLow: () => p2bLoop.walletLow(),
+        onUnsupported: () => gate.reportUnsupported(),
+        // KEEPER_LEV_POKE: sample the guard's NAV immediately before Earn principal moves into the LP (night fix F1)
+        beforeSend: levGuard && LEV_GUARD_CONFIG.poke ? (market, label) => levGuard.beforeAllocate(market.toBase58(), label) : undefined,
+      },
     ),
     windDown: new AdlWindDownRunner(
       { ...P2B_WIND_DOWN_CONFIG, dryRun: DRY_RUN },
@@ -741,11 +786,13 @@ if (MIN_POOL_LIQUIDITY_USD_E6 === 0n) {
 
 await startKeeperLoop(mainnetConn, devnetConn, keeper, registry, {
   withholdPush: (m) => getExhaustedRegistry().shouldWithholdPush(m, P3_EXHAUSTED_WITHHOLD_PUSHES),
-  onPushLanded: vaultLpCranker
-    ? (m, px, label) => {
-        void vaultLpCranker.onPushLanded(m, px, label);
-      }
-    : undefined,
+  onPushLanded:
+    vaultLpCranker || levGuard
+      ? (m, px, label) => {
+          if (vaultLpCranker) void vaultLpCranker.onPushLanded(m, px, label);
+          if (levGuard) void levGuard.onPushLanded(m, label);
+        }
+      : undefined,
   intervalMs: CC_INTERVAL_MS,
   healthPort: CC_HEALTH_PORT,
   healthBind: CC_HEALTH_BIND,
